@@ -4,8 +4,8 @@ Oracle PLSQL Package for JWT handling.
 Validates JWT using JWKS endpoint and RS256 signatures.
 
 Dependencies:
-- PACKAGE APEX_WEB_SERVICE
-- PACKAGE AS_CRYPTO Devires (https://github.com/Devires/as_crypto)
+- Package APEX_WEB_SERVICE
+- Package AS_CRYPTO Devires (https://github.com/Devires/as_crypto)
 
 ## Usage Example
 

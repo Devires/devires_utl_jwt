@@ -1,16 +1,16 @@
--- ===================================================================
--- Author:       Gilberto Holms | Devires Technology
--- Repository:   https://github.com/Devires/devires_utl_jwt
--- Licence:      MIT License
--- Version:      1.0.0
--- Date:         2021-07-26
--- Description:  Validates JWT using JWKS endpoint and RS256 key.
--- Dependencies: 
---   PACKAGE APEX_WEB_SERVICE
---   PACKAGE AS_CRYPTO Devires (https://github.com/Devires/as_crypto)
--- ===================================================================
-
 CREATE OR REPLACE PACKAGE DEVIRES_UTL_JWT AS 
+  --
+  -- ===================================================================
+  -- Author:       Gilberto Holms | Devires Technology
+  -- Repository:   https://github.com/Devires/devires_utl_jwt
+  -- Licence:      MIT License
+  -- Version:      1.0.0
+  -- Date:         2021-07-26
+  -- Description:  Validates JWT using JWKS endpoint and RS256 key.
+  -- Dependencies: 
+  --   Package APEX_WEB_SERVICE
+  --   Package AS_CRYPTO (https://github.com/Devires/as_crypto)
+  -- ===================================================================
   --
   C_JWKS_URL    CONSTANT CLOB   DEFAULT 'https://login.microsoftonline.com/common/discovery/v2.0/keys';
   --
