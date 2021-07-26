@@ -1,0 +1,388 @@
+-- ===================================================================
+-- Author:       Gilberto Holms | Devires Technology
+-- Repository:   https://github.com/Devires/devires_utl_jwt
+-- Licence:      MIT License
+-- Version:      1.0.0
+-- Date:         2021-07-26
+-- Description:  Validates JWT using JWKS endpoint and RS256 key.
+-- Dependencies: 
+--   PACKAGE APEX_WEB_SERVICE
+--   PACKAGE AS_CRYPTO Devires (https://github.com/Devires/as_crypto)
+-- ===================================================================
+
+CREATE OR REPLACE PACKAGE DEVIRES_UTL_JWT AS 
+  --
+  C_JWKS_URL    CONSTANT CLOB   DEFAULT 'https://login.microsoftonline.com/common/discovery/v2.0/keys';
+  --
+  PROCEDURE PARSE_JWT (
+    P_TOKEN IN  VARCHAR2,
+    P_ALG   OUT VARCHAR2,
+    P_KID   OUT VARCHAR2,
+    P_AUD   OUT VARCHAR2,
+    P_ISS   OUT VARCHAR2,
+    P_IAT   OUT DATE,
+    P_EXP   OUT DATE,
+    P_NBF   OUT DATE,
+    P_SUB   OUT VARCHAR2,
+    P_TID   OUT VARCHAR2
+  );
+  --
+  PROCEDURE VALIDATE_JWT (
+    P_TOKEN      IN  VARCHAR2,
+    P_VALID_AUDS IN  VARCHAR2,
+    P_IS_VALID   OUT BOOLEAN
+  );
+  --
+END;
+/
+
+CREATE OR REPLACE PACKAGE BODY DEVIRES_UTL_JWT AS 
+  --
+  C_EPOCH_DATE  CONSTANT DATE   DEFAULT TO_DATE('1-1-1970 00:00:00','MM-DD-YYYY HH24:Mi:SS');
+  C_SEGS_IN_DAY CONSTANT NUMBER DEFAULT 24 * 60 * 60;
+  --
+  FUNCTION SPLIT_STR (
+    P_STR    IN  VARCHAR2,
+    P_DELIM  IN  VARCHAR2 DEFAULT ','
+  ) RETURN SYS.ODCIVARCHAR2LIST DETERMINISTIC
+  AS
+    L_RESULT       SYS.ODCIVARCHAR2LIST := SYS.ODCIVARCHAR2LIST();
+    L_START        NUMBER(5) := 1;
+    L_END          NUMBER(5);
+    C_LEN CONSTANT NUMBER(5) := LENGTH(P_STR);
+    C_LD  CONSTANT NUMBER(5) := LENGTH(P_DELIM);
+  BEGIN
+    IF C_LEN > 0 THEN
+      L_END := INSTR( P_STR, P_DELIM, L_START );
+      WHILE L_END > 0 LOOP
+        L_RESULT.EXTEND;
+        L_RESULT( L_RESULT.COUNT ) := SUBSTR( P_STR, L_START, L_END - L_START );
+        L_START := L_END + C_LD;
+        L_END := INSTR( P_STR, P_DELIM, L_START );
+      END LOOP;
+      IF L_START <= C_LEN + 1 THEN
+        L_RESULT.EXTEND;
+        L_RESULT( L_RESULT.COUNT ) := SUBSTR( P_STR, L_START, C_LEN - L_START + 1 );
+      END IF;
+    END IF;
+    RETURN L_RESULT;
+  END;
+  --
+  FUNCTION EPOCH_SECS_TO_DATE (
+    P_EPOCH_SECS IN NUMBER
+  ) RETURN DATE
+  IS 
+  BEGIN
+    RETURN C_EPOCH_DATE + P_EPOCH_SECS / C_SEGS_IN_DAY;
+  END;
+  --
+  FUNCTION DATE_TO_EPOCH_SECS (
+    P_DATE IN DATE
+  ) RETURN NUMBER
+  IS 
+  BEGIN
+    RETURN (P_DATE - C_EPOCH_DATE) * C_SEGS_IN_DAY;
+  END;
+  --
+  FUNCTION BOOLEAN_TO_CHAR (
+    P_BOOL IN BOOLEAN
+  ) RETURN VARCHAR2 
+  IS
+  BEGIN
+    RETURN 
+      CASE P_BOOL
+        WHEN TRUE THEN 'TRUE'
+        WHEN FALSE THEN 'FALSE'
+        ELSE 'NULL'
+      END;
+  END;
+  --
+  FUNCTION BASE64URL_ENCODE (
+    P_RAW IN RAW
+  ) RETURN VARCHAR2
+  IS
+    L_RAW VARCHAR2(32767);
+  BEGIN
+    L_RAW := UTL_RAW.CAST_TO_VARCHAR2(UTL_ENCODE.BASE64_ENCODE(P_RAW));
+    L_RAW := replace(L_RAW, '+', '-');
+    L_RAW := replace(L_RAW, '/', '_');
+    L_RAW := replace(L_RAW, chr(10), '');
+    L_RAW := replace(L_RAW, chr(13), '');
+    L_RAW := rtrim(L_RAW, '=');
+    RETURN L_RAW;
+  END;
+  --
+  FUNCTION BASE64URL_ENCODE_FROM_CHAR (
+    P_STR IN VARCHAR2
+  ) RETURN VARCHAR2
+  IS
+  BEGIN
+    RETURN BASE64URL_ENCODE(UTL_RAW.CAST_TO_RAW(P_STR));
+  END;
+  --
+  FUNCTION BASE64URL_DECODE (
+    P_STR IN VARCHAR2
+  ) RETURN RAW
+  IS
+    L_STR VARCHAR2(32767);
+  BEGIN
+    L_STR := P_STR;
+    L_STR := replace(L_STR, '-', '+');
+    L_STR := replace(L_STR, '_', '/');
+    L_STR := rtrim(L_STR, '=' );
+    RETURN UTL_ENCODE.BASE64_DECODE(UTL_RAW.CAST_TO_RAW(L_STR));
+  END;
+  --
+  FUNCTION BASE64URL_DECODE_TO_CHAR (
+    P_STR IN VARCHAR2
+  ) RETURN VARCHAR2
+  IS
+  BEGIN
+    RETURN UTL_RAW.CAST_TO_VARCHAR2(BASE64URL_DECODE(P_STR));
+  END;
+  --
+  PROCEDURE FETCH_JWKS_CACHE 
+  IS
+    L_RESPONSE CLOB;
+  BEGIN
+
+    L_RESPONSE := APEX_WEB_SERVICE.MAKE_REST_REQUEST (
+      P_URL => C_JWKS_URL,
+      P_HTTP_METHOD => 'GET'
+    );
+
+    MERGE INTO UTL_JWKS_CACHE A
+    USING 
+      JSON_TABLE (L_RESPONSE, '$.keys[*]'
+          COLUMNS (
+              KID     VARCHAR2  PATH '$.kid',
+              N       VARCHAR2  PATH '$.n',
+              E       VARCHAR2  PATH '$.e'
+          )
+      ) B
+    ON (A.KEY_ID = B.KID)
+    WHEN MATCHED THEN
+      UPDATE SET 
+        KEY_MOD = B.N,
+        KEY_EXP = B.E,
+        LAST_UPDATED_AT = SYSTIMESTAMP
+    WHEN NOT MATCHED THEN
+      INSERT (KEY_ID, KEY_MOD, KEY_EXP, LAST_UPDATED_AT)
+      VALUES (B.KID, B.N, B.E, SYSTIMESTAMP);
+
+    COMMIT;
+
+  EXCEPTION 
+    WHEN OTHERS THEN RAISE_APPLICATION_ERROR(-20001, 'Error fetching jwks cache');
+
+  END FETCH_JWKS_CACHE;
+  --
+  PROCEDURE GET_JWKS_PUBLIC_KEY (
+    P_KID        IN  VARCHAR2,
+    P_PUBKEY_MOD OUT VARCHAR2,
+    P_PUBKEY_EXP OUT VARCHAR2
+  )
+  IS
+  BEGIN
+
+    BEGIN
+      SELECT KEY_MOD, KEY_EXP
+      INTO P_PUBKEY_MOD, P_PUBKEY_EXP
+      FROM UTL_JWKS_CACHE
+      WHERE KEY_ID = P_KID;
+    EXCEPTION 
+      WHEN NO_DATA_FOUND THEN FETCH_JWKS_CACHE;          
+    END;
+  
+    BEGIN
+      SELECT KEY_MOD, KEY_EXP
+      INTO P_PUBKEY_MOD, P_PUBKEY_EXP
+      FROM UTL_JWKS_CACHE
+      WHERE KEY_ID = P_KID;
+    END;
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN RAISE_APPLICATION_ERROR(-20001, 'Key not found for kid');
+    WHEN OTHERS THEN RAISE_APPLICATION_ERROR(-20001, 'Error getting jwks key');
+    
+  END GET_JWKS_PUBLIC_KEY;
+  --
+  PROCEDURE FIX_MICROSOFT_NONCED_HEADER (
+    P_TOKEN IN OUT VARCHAR2
+  )
+  IS
+    L_HEADER      VARCHAR2(4000); 
+    L_PAYLOAD     VARCHAR2(4000);
+    L_SIGNATURE   VARCHAR2(4000);
+    L_HEADER_JSON VARCHAR2(4000);
+    L_ALG         VARCHAR2(30);
+    L_NONCE       VARCHAR2(1000);
+    L_FIXED_NONCE VARCHAR2(1000);
+  BEGIN
+    
+    
+    L_HEADER := SUBSTR(P_TOKEN, 1, instr(P_TOKEN, '.') - 1);
+    L_PAYLOAD := SUBSTR(P_TOKEN, INSTR(P_TOKEN, '.') + 1, (INSTR(P_TOKEN, '.', 1, 2)) - (INSTR(P_TOKEN, '.') + 1));
+    L_SIGNATURE := SUBSTR(P_TOKEN, (INSTR(P_TOKEN, '.', 1, 2) + 1));
+    
+    L_HEADER_JSON := BASE64URL_DECODE_TO_CHAR(L_HEADER);
+    
+    SELECT ALG, NONCE
+    INTO L_ALG, L_NONCE
+    FROM
+      JSON_TABLE(L_HEADER_JSON, '$'
+        COLUMNS (
+            ALG       VARCHAR2  PATH '$.alg',
+            NONCE     VARCHAR2  PATH '$.nonce'
+        ));
+    
+    IF L_NONCE IS NOT NULL THEN
+      SELECT BASE64URL_ENCODE(STANDARD_HASH(L_NONCE, 'SHA256')) INTO L_FIXED_NONCE FROM DUAL;
+      L_HEADER_JSON := REPLACE(L_HEADER_JSON, L_NONCE, L_FIXED_NONCE);
+      L_HEADER :=  BASE64URL_ENCODE_FROM_CHAR(L_HEADER_JSON);
+    END IF;
+    
+    P_TOKEN := L_HEADER || '.' || L_PAYLOAD || '.' || L_SIGNATURE;
+
+  EXCEPTION
+    WHEN OTHERS THEN RAISE_APPLICATION_ERROR(-20001, 'Error parsing jwt payload');
+
+  END FIX_MICROSOFT_NONCED_HEADER;
+  --
+  PROCEDURE PARSE_JWT (
+    P_TOKEN IN  VARCHAR2,
+    P_ALG   OUT VARCHAR2,
+    P_KID   OUT VARCHAR2,
+    P_AUD   OUT VARCHAR2,
+    P_ISS   OUT VARCHAR2,
+    P_IAT   OUT DATE,
+    P_EXP   OUT DATE,
+    P_NBF   OUT DATE,
+    P_SUB   OUT VARCHAR2,
+    P_TID   OUT VARCHAR2
+  )
+  IS
+    L_HEADER_JSON  VARCHAR2(4000);
+    L_PAYLOAD_JSON VARCHAR2(4000);
+  BEGIN
+    
+    L_HEADER_JSON := BASE64URL_DECODE_TO_CHAR(SUBSTR(P_TOKEN, 1, instr(P_TOKEN, '.') - 1));
+    L_PAYLOAD_JSON := BASE64URL_DECODE_TO_CHAR(SUBSTR(P_TOKEN, INSTR(P_TOKEN, '.') + 1, (INSTR(P_TOKEN, '.', 1, 2)) - (INSTR(P_TOKEN, '.') + 1)));
+    
+    SELECT ALG, KID
+    INTO P_ALG, P_KID
+    FROM
+      JSON_TABLE(L_HEADER_JSON, '$'
+        COLUMNS (
+            ALG       VARCHAR2  PATH '$.alg',
+            KID       VARCHAR2  PATH '$.kid'
+        ));
+    
+    SELECT AUD, ISS, EPOCH_SECS_TO_DATE(IAT), EPOCH_SECS_TO_DATE(EXP), EPOCH_SECS_TO_DATE(NBF), SUB, TID
+    INTO P_AUD, P_ISS, P_IAT, P_EXP, P_NBF, P_SUB, P_TID
+    FROM
+      JSON_TABLE(L_PAYLOAD_JSON, '$'
+        COLUMNS (
+            AUD       VARCHAR2  PATH '$.aud',
+            ISS       VARCHAR2  PATH '$.iss',
+            IAT       NUMBER    PATH '$.iat',
+            EXP       NUMBER    PATH '$.exp',
+            NBF       NUMBER    PATH '$.nbf',
+            SUB       VARCHAR2  PATH '$.sub',
+            TID       VARCHAR2  PATH '$.tid'
+        ));
+
+  EXCEPTION
+    WHEN OTHERS THEN RAISE_APPLICATION_ERROR(-20001, 'Error parsing jwt payload');
+
+  END PARSE_JWT;
+  --
+  PROCEDURE VALIDATE_JWT (
+    P_TOKEN      IN  VARCHAR2,
+    P_VALID_AUDS IN  VARCHAR2,
+    P_IS_VALID   OUT BOOLEAN
+  )
+  IS    
+    L_TOKEN       VARCHAR2(4000);
+    L_ALG         VARCHAR2(30);
+    L_KID         VARCHAR2(1000);
+    L_AUD         VARCHAR2(1000);
+    L_ISS         VARCHAR2(255);
+    L_IAT         DATE;
+    L_EXP         DATE;
+    L_NBF         DATE;
+    L_SUB         VARCHAR2(255);
+    L_TID         VARCHAR2(255);
+    L_HEADER      VARCHAR2(4000);
+    L_PAYLOAD     VARCHAR2(4000);
+    L_SIGNATURE   VARCHAR2(4000);
+    L_SIGNED_DATA VARCHAR2(4000);
+    L_PUBKEY_MOD  VARCHAR2(4000);
+    L_PUBKEY_EXP  VARCHAR2(30);
+    L_TMP_RNUM    NUMBER; 
+  BEGIN
+    
+    P_IS_VALID := FALSE;
+    
+    L_TOKEN := P_TOKEN;
+    FIX_MICROSOFT_NONCED_HEADER (
+      P_TOKEN => L_TOKEN
+    );
+    
+    PARSE_JWT (
+      P_TOKEN => L_TOKEN,
+      P_ALG   => L_ALG,
+      P_KID   => L_KID,
+      P_AUD   => L_AUD,
+      P_ISS   => L_ISS,
+      P_IAT   => L_IAT,
+      P_EXP   => L_EXP,
+      P_NBF   => L_NBF,
+      P_SUB   => L_SUB,
+      P_TID   => L_TID
+    );
+    
+    L_HEADER := SUBSTR(L_TOKEN, 1, instr(L_TOKEN, '.') - 1);
+    L_PAYLOAD := SUBSTR(L_TOKEN, INSTR(L_TOKEN, '.') + 1, (INSTR(L_TOKEN, '.', 1, 2)) - (INSTR(L_TOKEN, '.') + 1));
+    L_SIGNATURE := SUBSTR(L_TOKEN, (INSTR(L_TOKEN, '.', 1, 2) + 1));
+    L_SIGNED_DATA := L_HEADER || '.' || L_PAYLOAD;
+    
+    GET_JWKS_PUBLIC_KEY(
+      P_KID        => L_KID,
+      P_PUBKEY_MOD => L_PUBKEY_MOD,
+      P_PUBKEY_EXP => L_PUBKEY_EXP
+    );
+    
+    -- CHECK TOKEN SIGNATURE
+    P_IS_VALID := AS_CRYPTO.VERIFY(
+      SRC        => UTL_RAW.CAST_TO_RAW(L_SIGNED_DATA), 
+      SIGN       => BASE64URL_DECODE(L_SIGNATURE), 
+      PUB_KEY_N  => BASE64URL_DECODE(L_PUBKEY_MOD), 
+      PUB_KEY_E  => BASE64URL_DECODE(L_PUBKEY_EXP), 
+      PUBKEY_ALG => AS_CRYPTO.KEY_TYPE_RSA, 
+      SIGN_ALG   => AS_CRYPTO.SIGN_SHA256_RSA
+    );
+    
+    -- CHECK TOKEN EXPIRATION
+    IF P_IS_VALID THEN
+        P_IS_VALID := CASE WHEN L_EXP > CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) THEN TRUE ELSE FALSE END;
+    END IF;
+    
+    -- CHECK TOKEN AUDIENCE
+    IF P_IS_VALID AND P_VALID_AUDS IS NOT NULL THEN
+      BEGIN
+        SELECT 1 INTO L_TMP_RNUM
+        FROM TABLE(SPLIT_STR(P_VALID_AUDS))
+        WHERE COLUMN_VALUE = L_AUD;
+      EXCEPTION 
+        WHEN NO_DATA_FOUND THEN P_IS_VALID := FALSE;          
+      END;
+    END IF;
+    
+  EXCEPTION
+    WHEN OTHERS THEN NULL;
+
+  END VALIDATE_JWT;
+  --
+END;
+/
